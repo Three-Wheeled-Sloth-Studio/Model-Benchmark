@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -199,10 +200,8 @@ class OllamaClient:
                 return
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        try:
+        with contextlib.suppress(OllamaError):
             self.generate(model, "", keep_alive=0, options={"num_predict": 1}, timeout=10)
-        except OllamaError:
-            pass
 
     def _request(
         self,
