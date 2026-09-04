@@ -1,0 +1,22 @@
+version: 1
+commands:
+  - id: unit-tests
+    required: true
+    command: python -m pytest
+    purpose: Validate scoring, filtering, and reporting without requiring Ollama.
+  - id: lint
+    required: true
+    command: python -m ruff check .
+    purpose: Keep the CLI and tests mechanically clean.
+  - id: compile
+    required: true
+    command: python -m compileall -q src tests
+    purpose: Catch syntax/import compilation failures.
+  - id: local-doctor
+    required: false
+    command: model-benchmark doctor
+    purpose: Inspect local Ollama and resource telemetry prerequisites.
+  - id: local-live-baseline
+    required: false
+    command: model-benchmark run
+    purpose: Run the real installed-model benchmark; never required in CI.

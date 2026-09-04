@@ -1,0 +1,288 @@
+{
+  "suite_id": "tws-structured-work-baseline",
+  "suite_version": "1.0.0",
+  "description": "Synthetic baseline for keyword signal extraction, structured semantic parsing, and evidence-grounded relative quality scoring.",
+  "cases": [
+    {
+      "id": "keyword_resume_chaff",
+      "category": "keyword",
+      "prompt": "Extract at most 8 search-useful keywords or short phrases from the resume excerpt below. Prefer domain, technical, workflow, and product concepts. Exclude generic filler such as leadership, experience, team, stakeholders, results, communication, and collaboration. Return only the requested JSON.\n\nResume excerpt:\nExperienced product leader with 15 years of experience leading cross-functional teams and working with stakeholders to deliver results. Built healthcare analytics products using FHIR and HL7 data, led product discovery with clinical users, and automated care-management workflows. Known for communication, collaboration, leadership, and a passion for improving outcomes.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 8
+          }
+        },
+        "required": ["keywords"],
+        "additionalProperties": false
+      },
+      "expected": {
+        "gold_keywords": [
+          "healthcare analytics",
+          "FHIR",
+          "HL7",
+          "product discovery",
+          "care management",
+          "workflow automation"
+        ],
+        "accepted_aliases": {
+          "care management": ["care-management", "care management workflows"],
+          "workflow automation": ["automated workflows", "workflow automation"]
+        },
+        "forbidden_terms": [
+          "leadership",
+          "experience",
+          "team",
+          "teams",
+          "stakeholders",
+          "results",
+          "communication",
+          "collaboration",
+          "passion",
+          "outcomes"
+        ],
+        "max_keywords": 8
+      }
+    },
+    {
+      "id": "keyword_frequency_trap",
+      "category": "keyword",
+      "prompt": "Extract at most 7 meaningful technical or domain keywords from the text. Frequency is not importance. Do not return generic business words even when repeated. Return JSON only.\n\nText:\nLeadership leadership leadership. Strategy strategy strategy. Teams, stakeholders, communication, delivery, results. The actual platform is a data reliability product built on Snowflake, dbt, Apache Airflow, and Great Expectations, with data lineage and data quality checks across regulated reporting pipelines. Leadership and stakeholder communication were important to delivery.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 7
+          }
+        },
+        "required": ["keywords"],
+        "additionalProperties": false
+      },
+      "expected": {
+        "gold_keywords": [
+          "Snowflake",
+          "dbt",
+          "Apache Airflow",
+          "Great Expectations",
+          "data lineage",
+          "data quality",
+          "regulated reporting"
+        ],
+        "accepted_aliases": {
+          "Apache Airflow": ["Airflow"],
+          "Great Expectations": ["great expectations"]
+        },
+        "forbidden_terms": [
+          "leadership",
+          "strategy",
+          "teams",
+          "stakeholders",
+          "communication",
+          "delivery",
+          "results"
+        ],
+        "max_keywords": 7
+      }
+    },
+    {
+      "id": "keyword_compound_signal",
+      "category": "keyword",
+      "prompt": "Extract at most 6 job-search keywords or phrases. Prefer specific compound concepts over broad single words. Do not return product, analytics, management, data, AI, or search by themselves. Return JSON only.\n\nText:\nThe role owns product analytics for an AI-assisted support platform. It includes retrieval augmented generation (RAG), vector search, evaluation pipelines, prompt quality measurement, and human-in-the-loop review. Product management and analytics experience are useful, but the important searchable concepts are the specific systems and practices above.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 6
+          }
+        },
+        "required": ["keywords"],
+        "additionalProperties": false
+      },
+      "expected": {
+        "gold_keywords": [
+          "product analytics",
+          "retrieval augmented generation",
+          "RAG",
+          "vector search",
+          "evaluation pipelines",
+          "human-in-the-loop"
+        ],
+        "accepted_aliases": {
+          "retrieval augmented generation": ["retrieval-augmented generation"],
+          "human-in-the-loop": ["human in the loop", "human-in-the-loop review"]
+        },
+        "forbidden_terms": ["product", "analytics", "management", "data", "AI", "search"],
+        "max_keywords": 6
+      }
+    },
+    {
+      "id": "semantic_job_posting",
+      "category": "semantic",
+      "prompt": "Parse the job posting into the supplied JSON schema. Distinguish required from preferred skills. Do not infer requirements that are not stated.\n\nPosting:\nSenior Product Manager, Clinical Data Platform. Remote within the United States, with quarterly travel to Raleigh, NC. Candidates need 5+ years of product management experience, hands-on work with healthcare data interoperability, and experience with FHIR. HL7 is strongly preferred. Experience with Snowflake is nice to have. This is an individual-contributor role.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string"},
+          "seniority": {"type": "string"},
+          "work_mode": {"type": "string"},
+          "locations": {"type": "array", "items": {"type": "string"}},
+          "required_skills": {"type": "array", "items": {"type": "string"}},
+          "preferred_skills": {"type": "array", "items": {"type": "string"}},
+          "minimum_years_experience": {"type": "number"},
+          "people_manager": {"type": "string"}
+        },
+        "required": [
+          "title",
+          "seniority",
+          "work_mode",
+          "locations",
+          "required_skills",
+          "preferred_skills",
+          "minimum_years_experience",
+          "people_manager"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "values": {
+          "title": "Senior Product Manager, Clinical Data Platform",
+          "seniority": "senior",
+          "work_mode": "remote",
+          "locations": ["United States", "Raleigh, NC"],
+          "required_skills": ["product management", "healthcare data interoperability", "FHIR"],
+          "preferred_skills": ["HL7", "Snowflake"],
+          "minimum_years_experience": 5,
+          "people_manager": "no"
+        },
+        "field_weights": {
+          "title": 1.0,
+          "seniority": 1.0,
+          "work_mode": 1.0,
+          "locations": 1.0,
+          "required_skills": 2.0,
+          "preferred_skills": 1.5,
+          "minimum_years_experience": 1.0,
+          "people_manager": 1.0
+        }
+      }
+    },
+    {
+      "id": "semantic_resume_evidence",
+      "category": "semantic",
+      "prompt": "Parse only explicitly supported resume evidence into the JSON schema. Do not infer a degree, certification, people-management scope, or industry not stated.\n\nResume excerpt:\nDirector of Product, 2021-2025. Owned a healthcare analytics portfolio and managed 8 direct reports across product and design. Shipped an offline-capable mobile mammography workflow. Earlier product work included behavioral-health reporting across 35+ states. Reduced delivery cycle time by 80% through discovery and release-process changes.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "most_recent_title": {"type": "string"},
+          "industries": {"type": "array", "items": {"type": "string"}},
+          "direct_reports": {"type": "number"},
+          "product_examples": {"type": "array", "items": {"type": "string"}},
+          "quantified_outcomes": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": [
+          "most_recent_title",
+          "industries",
+          "direct_reports",
+          "product_examples",
+          "quantified_outcomes"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "values": {
+          "most_recent_title": "Director of Product",
+          "industries": ["healthcare analytics", "behavioral health"],
+          "direct_reports": 8,
+          "product_examples": ["offline-capable mobile mammography workflow", "behavioral-health reporting"],
+          "quantified_outcomes": ["35+ states", "80% delivery cycle reduction"]
+        },
+        "field_weights": {
+          "most_recent_title": 1.0,
+          "industries": 1.5,
+          "direct_reports": 1.0,
+          "product_examples": 2.0,
+          "quantified_outcomes": 1.5
+        }
+      }
+    },
+    {
+      "id": "ranking_product_fit",
+      "category": "ranking",
+      "prompt": "Rank the three roles from strongest to weakest fit for the candidate. Scores are 0-100 but relative ordering and evidence-grounded reasoning matter more than exact numbers. Use only supplied evidence. Return each ID exactly once.\n\nCandidate evidence:\n- Product leader with healthcare analytics and FHIR experience.\n- Led product discovery and cross-functional delivery.\n- Managed product/design teams.\n- No ERP implementation experience is stated.\n- No consumer gaming experience is stated.\n\nA: Director of Product, Clinical Analytics. Own a healthcare analytics platform, lead product discovery, and guide FHIR interoperability work.\nB: Senior Product Manager, Enterprise ERP Migration. Lead product discovery for a multi-year SAP S/4HANA migration; deep ERP implementation experience strongly preferred.\nC: Product Director, Free-to-Play Games. Own live-ops monetization for a consumer mobile gaming portfolio; shipped free-to-play games required.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ranking": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {"type": "string"},
+                "score": {"type": "number", "minimum": 0, "maximum": 100},
+                "reason": {"type": "string"}
+              },
+              "required": ["id", "score", "reason"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["ranking"],
+        "additionalProperties": false
+      },
+      "expected": {
+        "order": ["A", "B", "C"],
+        "reason_evidence": {
+          "A": ["healthcare analytics", "FHIR", "product discovery"],
+          "B": ["ERP", "SAP", "product discovery"],
+          "C": ["gaming", "free-to-play", "consumer mobile"]
+        },
+        "forbidden_claims": ["SAP experience", "gaming experience", "shipped games"]
+      }
+    },
+    {
+      "id": "ranking_constraint_awareness",
+      "category": "ranking",
+      "prompt": "Rank these opportunities for the candidate. Prioritize stated hard constraints and direct evidence over impressive titles. Use a 0-100 score, but exact numeric values are not graded. Return each ID exactly once.\n\nCandidate evidence:\n- Seeking remote or hybrid product leadership roles.\n- Can commute to Raleigh, NC.\n- Strong data/AI product background.\n- No relocation is planned.\n\nA: Director of Product, AI Platform. Hybrid in Raleigh, NC, 2 days per week. Data/AI platform ownership required.\nB: VP Product, Analytics. Fully on-site in Seattle, WA; relocation required before start. Analytics leadership required.\nC: Senior Product Manager, AI Operations. Fully remote in the United States. AI workflow product experience preferred.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ranking": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {"type": "string"},
+                "score": {"type": "number", "minimum": 0, "maximum": 100},
+                "reason": {"type": "string"}
+              },
+              "required": ["id", "score", "reason"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["ranking"],
+        "additionalProperties": false
+      },
+      "expected": {
+        "order": ["A", "C", "B"],
+        "reason_evidence": {
+          "A": ["Raleigh", "hybrid", "data/AI"],
+          "C": ["remote", "AI workflow"],
+          "B": ["Seattle", "relocation", "on-site"]
+        },
+        "forbidden_claims": ["willing to relocate", "Seattle based", "lives in Seattle"]
+      }
+    }
+  ]
+}
