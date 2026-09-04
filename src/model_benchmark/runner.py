@@ -4,10 +4,11 @@ import fnmatch
 import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 from model_benchmark.config import BenchmarkConfig
