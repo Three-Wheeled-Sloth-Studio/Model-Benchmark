@@ -27,6 +27,33 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _unscored_score(reason: str) -> dict[str, Any]:
+    """Return a schema-stable score payload for a model that was never evaluated."""
+    return {
+        "score_status": "not_evaluated",
+        "score_reason": reason,
+        "quality_score": None,
+        "operational_score": None,
+        "composite_score_raw": None,
+        "composite_score": None,
+        "quality_components": {
+            "keyword_quality": None,
+            "semantic_quality": None,
+            "ranking_quality": None,
+            "adherence": None,
+        },
+        "operational_components": {
+            "cold_load_score": None,
+            "warm_throughput_score": None,
+            "memory_headroom_score": None,
+            "median_warm_tokens_per_second": None,
+            "cold_load_seconds": None,
+            "warm_load_seconds": None,
+        },
+        "penalties": [],
+    }
+
+
 class BenchmarkRunner:
     def __init__(
         self,
@@ -100,6 +127,8 @@ class BenchmarkRunner:
             resource_stats.observe(preflight)
             if preflight.available_ram_gb < self.config.min_available_ram_gb:
                 result["status"] = "host_resource_blocked"
+                result["block_stage"] = "host_preflight"
+                result["score"] = _unscored_score("host_preflight")
                 result["error"] = (
                     f"Available RAM {preflight.available_ram_gb:.2f} GB is below the "
                     f"{self.config.min_available_ram_gb:.2f} GB safety floor before model load."
@@ -359,13 +388,21 @@ class BenchmarkRunner:
         result["finished_at"] = utc_now()
         result["model_wall_time_seconds"] = round(time.monotonic() - started, 3)
         result["resource_stats"] = resource_stats.as_dict()
-        result["score"] = aggregate_model_score(result, self.config)
-        self.console(
-            f"[{result['model']['name']}] composite {result['score']['composite_score']:.1f} "
-            f"quality {result['score']['quality_score']:.1f} "
-            f"operational {result['score']['operational_score']:.1f} "
-            f"status {result['status']}"
-        )
+        if "score" not in result:
+            result["score"] = aggregate_model_score(result, self.config)
+        score = result["score"]
+        if score["composite_score"] is None:
+            self.console(
+                f"[{result['model']['name']}] unscored status {result['status']} "
+                f"stage {result.get('block_stage', 'n/a')}"
+            )
+        else:
+            self.console(
+                f"[{result['model']['name']}] composite {score['composite_score']:.1f} "
+                f"quality {score['quality_score']:.1f} "
+                f"operational {score['operational_score']:.1f} "
+                f"status {result['status']}"
+            )
         return result
 
     def metadata(self, selected_models: list[ModelCandidate]) -> dict[str, Any]:
