@@ -17,7 +17,21 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
 def write_reports(
     run_dir: Path, metadata: dict[str, Any], results: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    ranked = sorted(results, key=lambda item: item["score"]["composite_score"], reverse=True)
+    scored = [
+        item
+        for item in results
+        if (item.get("score") or {}).get("composite_score") is not None
+    ]
+    unscored = [
+        item
+        for item in results
+        if (item.get("score") or {}).get("composite_score") is None
+    ]
+    ranked = sorted(
+        scored,
+        key=lambda item: float(item["score"]["composite_score"]),
+        reverse=True,
+    )
     summary = {
         "schema_version": "1.0",
         "run_id": metadata["run_id"],
@@ -38,6 +52,17 @@ def write_reports(
             }
             for index, item in enumerate(ranked, 1)
         ],
+        "unscored_models": [
+            {
+                "model": item["model"]["name"],
+                "status": item["status"],
+                "block_stage": item.get("block_stage"),
+                "reason": item.get("error"),
+                "score": item.get("score"),
+                "resource_stats": item.get("resource_stats") or {},
+            }
+            for item in unscored
+        ],
         "skipped_models": metadata["skipped_models"],
     }
     (run_dir / "summary.json").write_text(
@@ -48,7 +73,9 @@ def write_reports(
         yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True),
         encoding="utf-8",
     )
-    (run_dir / "summary.md").write_text(_markdown(metadata, ranked), encoding="utf-8")
+    (run_dir / "summary.md").write_text(
+        _markdown(metadata, ranked, unscored), encoding="utf-8"
+    )
     return summary
 
 
@@ -64,7 +91,11 @@ def _fmt_gb_from_bytes(value: Any) -> str:
     return "n/a" if value is None else f"{float(value) / (1024.0 ** 3):.1f}"
 
 
-def _markdown(metadata: dict[str, Any], ranked: list[dict[str, Any]]) -> str:
+def _markdown(
+    metadata: dict[str, Any],
+    ranked: list[dict[str, Any]],
+    unscored: list[dict[str, Any]],
+) -> str:
     lines = [
         "# Model Benchmark Summary",
         "",
@@ -97,7 +128,29 @@ def _markdown(metadata: dict[str, Any], ranked: list[dict[str, Any]]) -> str:
             f"{item['status']} |"
         )
     if not ranked:
-        lines.append("| - | No eligible models | - | - | - | - | - | - | - | - | - | - | - |")
+        lines.append("| - | No scored models | - | - | - | - | - | - | - | - | - | - | - |")
+
+    lines.extend(["", "## Unscored models", ""])
+    if unscored:
+        lines.extend(
+            [
+                "These models were not evaluated and are excluded from the leaderboard.",
+                "",
+                "| Model | Status | Stage | Reason | Min RAM GB |",
+                "| --- | --- | --- | --- | ---: |",
+            ]
+        )
+        for item in unscored:
+            resources = item.get("resource_stats") or {}
+            reason = str(item.get("error") or "Not evaluated.").replace("|", "\\|")
+            lines.append(
+                f"| `{item['model']['name']}` | {item['status']} | "
+                f"{item.get('block_stage') or 'n/a'} | {reason} | "
+                f"{_fmt(resources.get('min_available_ram_gb'))} |"
+            )
+    else:
+        lines.append("None.")
+
     lines.extend(
         [
             "",
@@ -107,7 +160,7 @@ def _markdown(metadata: dict[str, Any], ranked: list[dict[str, Any]]) -> str:
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for item in ranked:
+    for item in [*ranked, *unscored]:
         resources = item.get("resource_stats") or {}
         residency = item.get("loaded_model_state") or {}
         model_vram = residency.get("size_vram_bytes")
@@ -120,6 +173,9 @@ def _markdown(metadata: dict[str, Any], ranked: list[dict[str, Any]]) -> str:
             f"{_fmt(resources.get('peak_gpu_utilization_percent'))} | "
             f"{_fmt_gb_from_bytes(model_vram)} |"
         )
+    if not ranked and not unscored:
+        lines.append("| No model results | - | - | - | - | - | - |")
+
     lines.extend(["", "## Skipped models", ""])
     if metadata["skipped_models"]:
         for item in metadata["skipped_models"]:
@@ -134,6 +190,9 @@ def _markdown(metadata: dict[str, Any], ranked: list[dict[str, Any]]) -> str:
             "Composite is the headline workstation-fit score, not a universal model leaderboard. "
             "Quality is first-class; operational fitness captures switching cost, throughput, and memory headroom. "
             "Timeout/resource penalties intentionally prevent a high-quality model from winning when it makes the host unsafe or impractical.",
+            "",
+            "A host-preflight block means the machine was already below the configured memory safety floor before the model was loaded. "
+            "It is not evidence that the model itself is too large or too slow, so no quality, operational, or composite score is assigned.",
             "",
         ]
     )
