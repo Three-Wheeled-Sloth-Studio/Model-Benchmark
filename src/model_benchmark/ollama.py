@@ -17,6 +17,13 @@ class OllamaError(RuntimeError):
     pass
 
 
+class OllamaHttpError(OllamaError):
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"Ollama HTTP {status_code}: {body[:500]}")
+
+
 @dataclass(frozen=True, slots=True)
 class ModelCandidate:
     name: str
@@ -41,9 +48,32 @@ _EMBED_HINTS = (
     "nomic-embed",
     "snowflake-arctic-embed",
 )
+_CODER_HINTS = (
+    "coder",
+    "codellama",
+    "codestral",
+    "devstral",
+    "starcoder",
+    "codegemma",
+)
+_VISION_HINTS = (
+    "-vl",
+    ":vl",
+    "vision",
+    "llava",
+    "bakllava",
+    "moondream",
+    "minicpm-v",
+)
+_REMOTE_PROVIDER_PREFIXES = (
+    "gemini-",
+    "gemini:",
+    "claude-",
+    "claude:",
+)
 
 
-def skip_reason(candidate: ModelCandidate) -> str | None:
+def skip_reason(candidate: ModelCandidate, *, allow_specialized: bool = False) -> str | None:
     normalized = candidate.name.casefold()
     if (
         normalized.endswith(":cloud")
@@ -51,8 +81,14 @@ def skip_reason(candidate: ModelCandidate) -> str | None:
         or ":cloud-" in normalized
     ):
         return "cloud-only tag; baseline is local-only"
+    if normalized.startswith(_REMOTE_PROVIDER_PREFIXES):
+        return "remote/provider model stub; baseline measures local Ollama inference only"
     if any(hint in normalized for hint in _EMBED_HINTS):
         return "embedding/reranking-only model; no baseline text/chat suite yet"
+    if not allow_specialized and any(hint in normalized for hint in _CODER_HINTS):
+        return "coding-specialist model; excluded from the general structured-work baseline"
+    if not allow_specialized and any(hint in normalized for hint in _VISION_HINTS):
+        return "vision/multimodal-specialist model; excluded from the text-only baseline"
     return None
 
 
@@ -147,6 +183,12 @@ class OllamaClient:
     def running_models(self) -> list[dict[str, Any]]:
         return list(self._request("GET", "/api/ps", timeout=10).get("models", []))
 
+    def is_model_running(self, model: str) -> bool:
+        return any(
+            (item.get("name") or item.get("model")) == model
+            for item in self.running_models()
+        )
+
     def generate(
         self,
         model: str,
@@ -172,32 +214,49 @@ class OllamaClient:
             payload["options"] = options
         return self._request("POST", "/api/generate", payload=payload, timeout=timeout)
 
-    def unload(self, model: str, timeout: float = 30.0) -> None:
-        running = self.running_models()
-        if not any(
-            (item.get("name") or item.get("model")) == model for item in running
-        ):
-            return
+    def unload(self, model: str, timeout: float = 30.0) -> bool:
+        if not self.is_model_running(model):
+            return True
         self.stop_model(model)
         deadline = time.monotonic() + min(timeout, 15.0)
         while time.monotonic() < deadline:
-            if not any(
-                (item.get("name") or item.get("model")) == model
-                for item in self.running_models()
-            ):
-                return
+            try:
+                if not self.is_model_running(model):
+                    return True
+            except OllamaError:
+                pass
             time.sleep(0.25)
+        return False
+
+    def recover_after_abort(self, model: str, timeout: float = 30.0) -> bool:
+        """Require a healthy API and an unloaded target model before another benchmark starts."""
+        deadline = time.monotonic() + timeout
+        last_stop = 0.0
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now - last_stop >= 2.0:
+                self.stop_model(model)
+                last_stop = now
+            if self.api_available(timeout=min(2.0, max(0.25, deadline - now))):
+                try:
+                    if not self.is_model_running(model):
+                        return True
+                except OllamaError:
+                    pass
+            time.sleep(0.5)
+        return False
 
     def stop_model(self, model: str) -> None:
         if self.ollama_path:
             try:
-                subprocess.run(
+                proc = subprocess.run(
                     [self.ollama_path, "stop", model],
                     capture_output=True,
                     timeout=10,
                     check=False,
                 )
-                return
+                if proc.returncode == 0:
+                    return
             except (OSError, subprocess.TimeoutExpired):
                 pass
         with contextlib.suppress(OllamaError):
@@ -227,7 +286,7 @@ class OllamaClient:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"Ollama HTTP {error.code}: {body[:500]}") from error
+            raise OllamaHttpError(error.code, body) from error
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise OllamaError(f"Ollama request failed: {error}") from error
         try:
