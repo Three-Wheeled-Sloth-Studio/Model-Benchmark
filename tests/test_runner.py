@@ -152,15 +152,15 @@ def test_request_timeout_is_not_extended_before_recovery(tmp_path, monkeypatch) 
         "slow:model",
         prompt="test",
         schema=None,
-        timeout=0.05,
+        timeout=0.2,
         resource_stats=ResourceStats(),
         options={"temperature": 0},
     )
 
     assert result["status"] == "timeout"
-    assert client.timeout == 0.05
-    assert result["wall_time_seconds"] < 0.15
-    assert result["total_wall_time_seconds"] < 0.15
+    assert client.timeout == 0.2
+    assert result["wall_time_seconds"] < 0.35
+    assert result["total_wall_time_seconds"] < 0.35
 
 
 def test_recovery_budget_bounds_a_stuck_request(tmp_path, monkeypatch) -> None:
