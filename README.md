@@ -66,7 +66,16 @@ Defaults:
 - bounded output;
 - one model loaded at a time.
 
-The harness explicitly unloads a candidate, performs a tiny cold probe, runs the synthetic suite while warm, repeats one representative case as a warm probe, and unloads the model before proceeding. Every installed Ollama tag is treated as a distinct candidate. Embedding/reranking-only and cloud-only tags are skipped with a recorded reason.
+The harness explicitly unloads a candidate, performs a tiny cold probe, runs the synthetic suite while warm, repeats one representative case as a warm probe, and unloads the model before proceeding. Every installed Ollama tag is treated as a distinct candidate.
+
+Broad baseline sweeps skip models that are clearly unsuitable for this text-only general-work suite, with the reason recorded:
+
+- embedding/reranking-only models;
+- cloud or remote-provider stubs;
+- coding-specialist models;
+- vision/multimodal-specialist models.
+
+An explicit `--model` selection is an escape hatch for specialized local text-generation models. For example, `model-benchmark run --model "qwen3-coder*"` will intentionally include that coder model even though a broad general baseline would skip it. Cloud/remote and embedding-only models remain excluded because this suite does not exercise them correctly.
 
 ## Results
 
@@ -80,11 +89,17 @@ Each invocation creates `benchmark-results/<run-id>/` containing:
 
 Benchmark outputs are ignored by Git by default.
 
-## Resource protection
+## Resource protection and recovery
 
 While each Ollama request runs, the harness samples host resources. If available system RAM falls below the configured floor, it calls `ollama stop <model>`, marks the candidate `resource_abort`, and does not pretend the run succeeded. A per-test timeout is handled similarly.
 
+After a timeout or resource abort, the harness requires the outstanding request to finish, the target model to be unloaded, and the Ollama API to respond normally before another model may start. If that recovery check fails, the entire sweep stops and remaining models are recorded as not attempted. This prevents one pathological model from contaminating the results of every model that follows it.
+
+A model that fails before completing its cold probe is unscored. Missing cold-load or quality measurements remain `null`; they are never converted into synthetic zero-quality or perfect cold-load values.
+
 Full VRAM use by itself is not an abort condition because Ollama can legitimately spill into system RAM. VRAM pressure is recorded; system-memory headroom is the primary safety signal.
+
+On Windows, GPU telemetry first checks `PATH` and then the standard NVIDIA NVSMI and System32 locations for `nvidia-smi.exe`. `model-benchmark doctor` prints the resolved executable path when found.
 
 ## Benchmark philosophy
 
