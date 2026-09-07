@@ -6,8 +6,8 @@ from model_benchmark.runner import BenchmarkRunner
 
 
 class FakeClient:
-    def unload(self, model: str) -> None:
-        pass
+    def unload(self, model: str) -> bool:
+        return True
 
     def stop_model(self, model: str) -> None:
         pass
