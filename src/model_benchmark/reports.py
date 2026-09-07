@@ -42,6 +42,7 @@ def write_reports(
                 "rank": index,
                 "model": item["model"]["name"],
                 "status": item["status"],
+                "failure_stage": item.get("failure_stage"),
                 "composite_score": item["score"]["composite_score"],
                 "quality_score": item["score"]["quality_score"],
                 "operational_score": item["score"]["operational_score"],
@@ -56,7 +57,9 @@ def write_reports(
             {
                 "model": item["model"]["name"],
                 "status": item["status"],
+                "failure_stage": item.get("failure_stage") or item.get("block_stage"),
                 "block_stage": item.get("block_stage"),
+                "recovery_status": item.get("recovery_status"),
                 "reason": item.get("error"),
                 "score": item.get("score"),
                 "resource_stats": item.get("resource_stats") or {},
@@ -64,6 +67,7 @@ def write_reports(
             for item in unscored
         ],
         "skipped_models": metadata["skipped_models"],
+        "sweep_abort_reason": metadata.get("sweep_abort_reason"),
     }
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
@@ -136,20 +140,33 @@ def _markdown(
             [
                 "These models were not evaluated and are excluded from the leaderboard.",
                 "",
-                "| Model | Status | Stage | Reason | Min RAM GB |",
-                "| --- | --- | --- | --- | ---: |",
+                "| Model | Status | Stage | Recovery | Reason | Min RAM GB |",
+                "| --- | --- | --- | --- | --- | ---: |",
             ]
         )
         for item in unscored:
             resources = item.get("resource_stats") or {}
             reason = str(item.get("error") or "Not evaluated.").replace("|", "\\|")
+            stage = item.get("failure_stage") or item.get("block_stage") or "n/a"
             lines.append(
-                f"| `{item['model']['name']}` | {item['status']} | "
-                f"{item.get('block_stage') or 'n/a'} | {reason} | "
+                f"| `{item['model']['name']}` | {item['status']} | {stage} | "
+                f"{item.get('recovery_status') or 'n/a'} | {reason} | "
                 f"{_fmt(resources.get('min_available_ram_gb'))} |"
             )
     else:
         lines.append("None.")
+
+    if metadata.get("sweep_abort_reason"):
+        lines.extend(
+            [
+                "",
+                "## Sweep halted",
+                "",
+                str(metadata["sweep_abort_reason"]),
+                "",
+                "Remaining models were deliberately not attempted because their results could have been contaminated by an unhealthy Ollama state.",
+            ]
+        )
 
     lines.extend(
         [
@@ -193,6 +210,8 @@ def _markdown(
             "",
             "A host-preflight block means the machine was already below the configured memory safety floor before the model was loaded. "
             "It is not evidence that the model itself is too large or too slow, so no quality, operational, or composite score is assigned.",
+            "",
+            "Likewise, a model that fails before completing its cold probe is unscored rather than being assigned synthetic zero-quality or perfect cold-load values.",
             "",
         ]
     )

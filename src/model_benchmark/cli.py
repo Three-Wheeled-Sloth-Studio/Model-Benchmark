@@ -110,7 +110,23 @@ def _run(args: argparse.Namespace) -> int:
             result = runner.run_model(model)
             results.append(result)
             append_jsonl(runner.run_dir / "results.jsonl", result)
+            if runner.sweep_abort_reason:
+                remaining_models = models[index:]
+                for remaining in remaining_models:
+                    runner.skipped_models.append(
+                        {
+                            "model": remaining.name,
+                            "reason": f"not attempted after sweep halt: {runner.sweep_abort_reason}",
+                        }
+                    )
+                print(
+                    "\nHALTING SWEEP: "
+                    f"{runner.sweep_abort_reason} Remaining models will not be attempted."
+                )
+                break
         metadata["finished_at"] = datetime.now(UTC).isoformat()
+        metadata["sweep_abort_reason"] = runner.sweep_abort_reason
+        metadata["skipped_models"] = runner.skipped_models
         summary = write_reports(runner.run_dir, metadata, results)
         print("\n=== Final ranking ===")
         for item in summary["rankings"]:
@@ -122,6 +138,8 @@ def _run(args: argparse.Namespace) -> int:
                 f"status={item['status']}"
             )
         print(f"\nSummary: {runner.run_dir / 'summary.md'}")
+        if runner.sweep_abort_reason:
+            return 2
         return 0 if any(item["status"] == "succeeded" for item in results) else 1
     finally:
         runner.cleanup()
@@ -152,6 +170,8 @@ def _doctor() -> int:
     print(f"Ollama executable: {client.ollama_path or 'NOT FOUND'}")
     print(f"Ollama API reachable: {'yes' if available_before else 'no'}")
     print(f"nvidia-smi available: {'yes' if collector.nvidia_smi else 'no'}")
+    if collector.nvidia_smi:
+        print(f"nvidia-smi path: {collector.nvidia_smi}")
     snapshot = collector.hardware_snapshot()
     print(json.dumps(snapshot, indent=2, sort_keys=True))
     if not client.ollama_path and not available_before:

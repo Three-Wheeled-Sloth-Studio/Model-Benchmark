@@ -7,12 +7,38 @@ import platform
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import psutil
 
 _GB = 1024**3
+
+
+def discover_nvidia_smi(
+    *, platform_name: str | None = None, environ: Mapping[str, str] | None = None
+) -> str | None:
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    current_platform = os.name if platform_name is None else platform_name
+    if current_platform != "nt":
+        return None
+    env = os.environ if environ is None else environ
+    candidates: list[Path] = []
+    for variable in ("ProgramFiles", "ProgramW6432"):
+        root = env.get(variable)
+        if root:
+            candidates.append(Path(root) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe")
+    system_root = env.get("SystemRoot")
+    if system_root:
+        candidates.append(Path(system_root) / "System32" / "nvidia-smi.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 @dataclass(slots=True)
@@ -72,9 +98,11 @@ class ResourceStats:
 
 class ResourceCollector:
     def __init__(self, gpu_telemetry: bool = True) -> None:
-        self.nvidia_smi = shutil.which("nvidia-smi") if gpu_telemetry else None
+        self.nvidia_smi = discover_nvidia_smi() if gpu_telemetry else None
         self._last_gpu_sample_at = 0.0
         self._last_gpus: list[GpuSnapshot] = []
+        self._last_process_scan_at = 0.0
+        self._ollama_processes: list[psutil.Process] = []
         psutil.cpu_percent(interval=None)
 
     def sample(self) -> ResourceSnapshot:
@@ -88,7 +116,7 @@ class ResourceCollector:
             total_ram_gb=memory.total / _GB,
             ram_percent=float(memory.percent),
             cpu_percent=float(psutil.cpu_percent(interval=None)),
-            ollama_rss_gb=self._ollama_rss() / _GB,
+            ollama_rss_gb=self._ollama_rss(now) / _GB,
             gpus=list(self._last_gpus),
         )
 
@@ -106,19 +134,34 @@ class ResourceCollector:
             "total_ram_gb": round(memory.total / _GB, 3),
             "gpus": [asdict(item) for item in self._gpu_snapshot(include_driver=True)],
             "nvidia_smi_available": bool(self.nvidia_smi),
+            "nvidia_smi_path": self.nvidia_smi,
         }
 
-    @staticmethod
-    def _ollama_rss() -> int:
-        total = 0
-        for process in psutil.process_iter(["name", "memory_info"]):
+    def _refresh_ollama_processes(self, now: float) -> None:
+        if now - self._last_process_scan_at < 5.0:
+            return
+        processes: list[psutil.Process] = []
+        for process in psutil.process_iter(["name"]):
             try:
                 name = (process.info.get("name") or "").casefold()
                 if "ollama" in name:
-                    info = process.info.get("memory_info")
-                    total += int(info.rss) if info else 0
+                    processes.append(process)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+        self._ollama_processes = processes
+        self._last_process_scan_at = now
+
+    def _ollama_rss(self, now: float) -> int:
+        self._refresh_ollama_processes(now)
+        total = 0
+        alive: list[psutil.Process] = []
+        for process in self._ollama_processes:
+            try:
+                total += int(process.memory_info().rss)
+                alive.append(process)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        self._ollama_processes = alive
         return total
 
     def _gpu_snapshot(self, include_driver: bool = False) -> list[GpuSnapshot]:

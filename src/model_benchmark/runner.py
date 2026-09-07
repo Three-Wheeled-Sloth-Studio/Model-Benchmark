@@ -13,7 +13,13 @@ from uuid import uuid4
 
 from model_benchmark.config import BenchmarkConfig
 from model_benchmark.fixtures import BenchmarkCase, BenchmarkSuite
-from model_benchmark.ollama import ModelCandidate, OllamaClient, OllamaError, skip_reason
+from model_benchmark.ollama import (
+    ModelCandidate,
+    OllamaClient,
+    OllamaError,
+    OllamaHttpError,
+    skip_reason,
+)
 from model_benchmark.resources import ResourceCollector, ResourceStats
 from model_benchmark.scoring import aggregate_model_score, score_case
 
@@ -21,6 +27,7 @@ _SYSTEM_PROMPT = (
     "You are running a deterministic local benchmark. Follow the requested output schema exactly. "
     "Use only evidence present in the prompt. Do not add generic filler merely because it sounds professional."
 )
+_RECOVERY_TIMEOUT_SECONDS = 30.0
 
 
 def utc_now() -> str:
@@ -74,6 +81,7 @@ class BenchmarkRunner:
         self.started_at = utc_now()
         self.started_ollama = False
         self.skipped_models: list[dict[str, str]] = []
+        self.sweep_abort_reason: str | None = None
 
     def prepare(self) -> list[ModelCandidate]:
         self.started_ollama = self.client.ensure_running(
@@ -81,18 +89,19 @@ class BenchmarkRunner:
         )
         models = self.client.list_models()
         selected: list[ModelCandidate] = []
+        explicit_selection = bool(self.config.model_patterns)
         for candidate in models:
-            reason = skip_reason(candidate)
-            if reason:
-                self.skipped_models.append({"model": candidate.name, "reason": reason})
-                continue
-            if self.config.model_patterns and not any(
+            if explicit_selection and not any(
                 fnmatch.fnmatch(candidate.name.casefold(), pattern.casefold())
                 for pattern in self.config.model_patterns
             ):
                 self.skipped_models.append(
                     {"model": candidate.name, "reason": "does not match requested --model pattern"}
                 )
+                continue
+            reason = skip_reason(candidate, allow_specialized=explicit_selection)
+            if reason:
+                self.skipped_models.append({"model": candidate.name, "reason": reason})
                 continue
             selected.append(candidate)
         return selected
@@ -121,8 +130,18 @@ class BenchmarkRunner:
             "status": "running",
             "tests": [],
         }
+        current_stage = "pre_cold_unload"
         try:
-            self.client.unload(candidate.name)
+            if not self.client.unload(candidate.name):
+                result["status"] = "failed"
+                result["failure_stage"] = current_stage
+                result["score"] = _unscored_score(current_stage)
+                result["error"] = "Could not confirm the model was unloaded before the cold probe."
+                self.sweep_abort_reason = (
+                    f"Ollama could not establish a clean unloaded state for {candidate.name}."
+                )
+                return self._finish_model(result, resource_stats, started)
+
             preflight = self.resources.sample()
             resource_stats.observe(preflight)
             if preflight.available_ram_gb < self.config.min_available_ram_gb:
@@ -134,9 +153,13 @@ class BenchmarkRunner:
                     f"{self.config.min_available_ram_gb:.2f} GB safety floor before model load."
                 )
                 return self._finish_model(result, resource_stats, started)
+
+            current_stage = "cold_load"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 result["status"] = "timeout"
+                result["failure_stage"] = current_stage
+                result["score"] = _unscored_score(current_stage)
                 return self._finish_model(result, resource_stats, started)
 
             self.console(f"[{candidate.name}] cold-load probe")
@@ -156,14 +179,29 @@ class BenchmarkRunner:
             result["cold_probe"] = cold
             if cold["status"] == "succeeded":
                 result["loaded_model_state"] = self._loaded_model_state(candidate.name)
-            if cold["status"] != "succeeded":
-                result["status"] = cold["status"]
+            else:
+                result["status"] = (
+                    "unavailable"
+                    if cold.get("http_status") in {404, 410}
+                    else cold["status"]
+                )
+                result["failure_stage"] = current_stage
+                result["score"] = _unscored_score(current_stage)
+                if cold.get("error"):
+                    result["error"] = cold["error"]
+                if cold.get("http_status") is not None:
+                    result["http_status"] = cold["http_status"]
+                if cold.get("recovery_status"):
+                    result["recovery_status"] = cold["recovery_status"]
+                self._track_service_health(candidate.name, current_stage, cold)
                 return self._finish_model(result, resource_stats, started)
 
             for case in self.suite.cases:
+                current_stage = f"benchmark_case:{case.id}"
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     result["status"] = "timeout"
+                    result["failure_stage"] = current_stage
                     break
                 self.console(f"[{candidate.name}] {case.category}: {case.id}")
                 test_result = self._run_case(
@@ -173,14 +211,14 @@ class BenchmarkRunner:
                     resource_stats=resource_stats,
                 )
                 result["tests"].append(test_result)
-                if test_result["status"] == "resource_abort":
-                    result["status"] = "resource_abort"
-                    break
-                if test_result["status"] == "timeout":
-                    result["status"] = "timeout"
+                if test_result["status"] in {"resource_abort", "timeout"}:
+                    result["status"] = test_result["status"]
+                    result["failure_stage"] = current_stage
+                    self._track_service_health(candidate.name, current_stage, test_result)
                     break
 
             if result["status"] == "running":
+                current_stage = "warm_probe"
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     self.console(f"[{candidate.name}] representative warm probe")
@@ -195,8 +233,13 @@ class BenchmarkRunner:
                     )
                     if result["warm_probe"]["status"] != "succeeded":
                         result["status"] = result["warm_probe"]["status"]
+                        result["failure_stage"] = current_stage
+                        self._track_service_health(
+                            candidate.name, current_stage, result["warm_probe"]
+                        )
                 else:
                     result["status"] = "timeout"
+                    result["failure_stage"] = current_stage
 
             if result["status"] == "running":
                 failed = [item for item in result["tests"] if item["status"] != "succeeded"]
@@ -204,7 +247,17 @@ class BenchmarkRunner:
             return self._finish_model(result, resource_stats, started)
         except (OllamaError, OSError) as error:
             result["status"] = "failed"
+            result["failure_stage"] = current_stage
             result["error"] = str(error)
+            if isinstance(error, OllamaHttpError):
+                result["http_status"] = error.status_code
+                if error.status_code in {404, 410} and current_stage == "cold_load":
+                    result["status"] = "unavailable"
+                    result["score"] = _unscored_score(current_stage)
+            if not self.client.api_available(timeout=2.0):
+                self.sweep_abort_reason = (
+                    f"Ollama API became unhealthy while testing {candidate.name} at {current_stage}."
+                )
             return self._finish_model(result, resource_stats, started)
         finally:
             self.client.stop_model(candidate.name)
@@ -289,19 +342,18 @@ class BenchmarkRunner:
                     f"[{model}] stopping: available RAM {snapshot.available_ram_gb:.2f} GB "
                     f"fell below {self.config.min_available_ram_gb:.2f} GB floor"
                 )
-                self.client.stop_model(model)
                 break
             if time.monotonic() - started >= timeout:
                 abort_reason = "timeout"
                 self.console(f"[{model}] stopping: test exceeded {timeout:.0f} seconds")
-                self.client.stop_model(model)
                 break
             time.sleep(self.config.sample_interval_seconds)
 
         if abort_reason:
-            thread.join(timeout=10)
+            recovery_ok = self._recover_request(model, thread)
             return {
                 "status": abort_reason,
+                "recovery_status": "recovered" if recovery_ok else "failed",
                 "wall_time_seconds": round(time.monotonic() - started, 3),
                 "metrics": {},
                 "resource_stats": request_stats.as_dict(),
@@ -313,18 +365,23 @@ class BenchmarkRunner:
             return {
                 "status": "failed",
                 "error": "generation ended without a result",
+                "api_healthy_after_error": self.client.api_available(timeout=2.0),
                 "wall_time_seconds": round(time.monotonic() - started, 3),
                 "metrics": {},
                 "resource_stats": request_stats.as_dict(),
             }
         if outcome == "error":
-            return {
+            result = {
                 "status": "failed",
                 "error": str(payload),
+                "api_healthy_after_error": self.client.api_available(timeout=2.0),
                 "wall_time_seconds": round(time.monotonic() - started, 3),
                 "metrics": {},
                 "resource_stats": request_stats.as_dict(),
             }
+            if isinstance(payload, OllamaHttpError):
+                result["http_status"] = payload.status_code
+            return result
         metrics = self._ollama_metrics(payload)
         return {
             "status": "succeeded",
@@ -335,6 +392,27 @@ class BenchmarkRunner:
             "metrics": metrics,
             "resource_stats": request_stats.as_dict(),
         }
+
+    def _recover_request(self, model: str, thread: threading.Thread) -> bool:
+        self.client.stop_model(model)
+        deadline = time.monotonic() + _RECOVERY_TIMEOUT_SECONDS
+        while thread.is_alive() and time.monotonic() < deadline:
+            thread.join(timeout=0.25)
+        remaining = max(0.25, deadline - time.monotonic())
+        service_ok = self.client.recover_after_abort(model, timeout=remaining)
+        return service_ok and not thread.is_alive()
+
+    def _track_service_health(
+        self, model: str, stage: str, generation_result: dict[str, Any]
+    ) -> None:
+        if generation_result.get("recovery_status") == "failed":
+            self.sweep_abort_reason = (
+                f"Ollama did not recover cleanly after {model} failed at {stage}."
+            )
+        elif generation_result.get("api_healthy_after_error") is False:
+            self.sweep_abort_reason = (
+                f"Ollama API became unhealthy after {model} failed at {stage}."
+            )
 
     @staticmethod
     def _ollama_metrics(payload: dict[str, Any]) -> dict[str, Any]:
@@ -394,7 +472,7 @@ class BenchmarkRunner:
         if score["composite_score"] is None:
             self.console(
                 f"[{result['model']['name']}] unscored status {result['status']} "
-                f"stage {result.get('block_stage', 'n/a')}"
+                f"stage {result.get('failure_stage') or result.get('block_stage') or 'n/a'}"
             )
         else:
             self.console(
@@ -421,6 +499,7 @@ class BenchmarkRunner:
             "ollama_started_by_harness": self.started_ollama,
             "selected_models": [item.name for item in selected_models],
             "skipped_models": self.skipped_models,
+            "sweep_abort_reason": self.sweep_abort_reason,
         }
 
     def cleanup(self) -> None:
