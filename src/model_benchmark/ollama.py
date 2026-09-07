@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import shutil
@@ -180,13 +179,13 @@ class OllamaClient:
             )
         return [item for item in result if item.name]
 
-    def running_models(self) -> list[dict[str, Any]]:
-        return list(self._request("GET", "/api/ps", timeout=10).get("models", []))
+    def running_models(self, timeout: float = 10.0) -> list[dict[str, Any]]:
+        return list(self._request("GET", "/api/ps", timeout=timeout).get("models", []))
 
-    def is_model_running(self, model: str) -> bool:
+    def is_model_running(self, model: str, timeout: float = 10.0) -> bool:
         return any(
             (item.get("name") or item.get("model")) == model
-            for item in self.running_models()
+            for item in self.running_models(timeout=timeout)
         )
 
     def generate(
@@ -200,6 +199,7 @@ class OllamaClient:
         keep_alive: str | int = "15m",
         timeout: float = 330.0,
     ) -> dict[str, Any]:
+        """Low-level generate endpoint retained for compatibility and unload fallback."""
         payload: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
@@ -214,53 +214,131 @@ class OllamaClient:
             payload["options"] = options
         return self._request("POST", "/api/generate", payload=payload, timeout=timeout)
 
+    def chat(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        system: str | None = None,
+        schema: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        keep_alive: str | int = "15m",
+        think: bool = False,
+        timeout: float = 330.0,
+    ) -> dict[str, Any]:
+        """Run benchmark inference through chat so thinking can be disabled reliably."""
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": keep_alive,
+            "think": think,
+        }
+        if schema:
+            payload["format"] = schema
+        if options:
+            payload["options"] = options
+        return self._request("POST", "/api/chat", payload=payload, timeout=timeout)
+
     def unload(self, model: str, timeout: float = 30.0) -> bool:
-        if not self.is_model_running(model):
-            return True
-        self.stop_model(model)
-        deadline = time.monotonic() + min(timeout, 15.0)
+        deadline = time.monotonic() + timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            if not self.is_model_running(model, timeout=min(2.0, remaining)):
+                return True
+        except OllamaError:
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        self.stop_model(model, timeout=min(3.0, remaining))
         while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
             try:
-                if not self.is_model_running(model):
+                if not self.is_model_running(model, timeout=min(1.0, max(0.1, remaining))):
                     return True
             except OllamaError:
                 pass
-            time.sleep(0.25)
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         return False
 
-    def recover_after_abort(self, model: str, timeout: float = 30.0) -> bool:
-        """Require a healthy API and an unloaded target model before another benchmark starts."""
-        deadline = time.monotonic() + timeout
+    def recover_after_abort(self, model: str, timeout: float = 15.0) -> bool:
+        """Require a healthy API and unloaded target model within a strict recovery budget."""
+        deadline = time.monotonic() + max(0.0, timeout)
         last_stop = 0.0
         while time.monotonic() < deadline:
             now = time.monotonic()
-            if now - last_stop >= 2.0:
-                self.stop_model(model)
-                last_stop = now
-            if self.api_available(timeout=min(2.0, max(0.25, deadline - now))):
+            remaining = deadline - now
+            if now - last_stop >= 1.0:
+                self.stop_model(
+                    model,
+                    timeout=min(2.0, max(0.1, remaining)),
+                    allow_fallback=False,
+                )
+                last_stop = time.monotonic()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self.api_available(timeout=min(1.0, max(0.1, remaining))):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 try:
-                    if not self.is_model_running(model):
+                    if not self.is_model_running(
+                        model, timeout=min(1.0, max(0.1, remaining))
+                    ):
                         return True
                 except OllamaError:
                     pass
-            time.sleep(0.5)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.25, remaining))
         return False
 
-    def stop_model(self, model: str) -> None:
+    def stop_model(
+        self,
+        model: str,
+        *,
+        timeout: float = 10.0,
+        allow_fallback: bool = True,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
         if self.ollama_path:
-            try:
-                proc = subprocess.run(
-                    [self.ollama_path, "stop", model],
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-                if proc.returncode == 0:
-                    return
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        with contextlib.suppress(OllamaError):
-            self.generate(model, "", keep_alive=0, options={"num_predict": 1}, timeout=10)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    proc = subprocess.run(
+                        [self.ollama_path, "stop", model],
+                        capture_output=True,
+                        timeout=max(0.1, remaining),
+                        check=False,
+                    )
+                    if proc.returncode == 0:
+                        return True
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        if not allow_fallback:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            self.generate(
+                model,
+                "",
+                keep_alive=0,
+                options={"num_predict": 1},
+                timeout=max(0.1, remaining),
+            )
+        except OllamaError:
+            return False
+        return True
 
     def _request(
         self,

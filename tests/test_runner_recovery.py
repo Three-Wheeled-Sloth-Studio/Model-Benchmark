@@ -23,12 +23,12 @@ class TimedOutClient:
     def unload(self, _model: str) -> bool:
         return True
 
-    def generate(self, *_args, **_kwargs):
+    def chat(self, *_args, **_kwargs):
         time.sleep(0.05)
-        return {"response": "OK"}
+        return {"message": {"content": "OK"}}
 
-    def stop_model(self, _model: str) -> None:
-        return None
+    def stop_model(self, _model: str, **_kwargs) -> bool:
+        return True
 
     def recover_after_abort(self, _model: str, timeout: float = 30.0) -> bool:
         assert timeout > 0

@@ -27,7 +27,7 @@ _SYSTEM_PROMPT = (
     "You are running a deterministic local benchmark. Follow the requested output schema exactly. "
     "Use only evidence present in the prompt. Do not add generic filler merely because it sounds professional."
 )
-_RECOVERY_TIMEOUT_SECONDS = 30.0
+_RECOVERY_TIMEOUT_SECONDS = 15.0
 
 
 def utc_now() -> str:
@@ -260,7 +260,9 @@ class BenchmarkRunner:
                 )
             return self._finish_model(result, resource_stats, started)
         finally:
-            self.client.stop_model(candidate.name)
+            self.client.stop_model(
+                candidate.name, timeout=3.0, allow_fallback=False
+            )
 
     def _run_case(
         self,
@@ -315,14 +317,15 @@ class BenchmarkRunner:
                 response_queue.put(
                     (
                         "ok",
-                        self.client.generate(
+                        self.client.chat(
                             model,
                             prompt,
                             system=_SYSTEM_PROMPT,
                             schema=schema,
                             options=options,
                             keep_alive=-1,
-                            timeout=timeout + 20.0,
+                            think=False,
+                            timeout=max(0.1, timeout),
                         ),
                     )
                 )
@@ -332,12 +335,14 @@ class BenchmarkRunner:
         thread = threading.Thread(target=invoke, daemon=True)
         thread.start()
         abort_reason: str | None = None
+        abort_detected_at: float | None = None
         while thread.is_alive():
             snapshot = self.resources.sample()
             resource_stats.observe(snapshot)
             request_stats.observe(snapshot)
             if snapshot.available_ram_gb < self.config.min_available_ram_gb:
                 abort_reason = "resource_abort"
+                abort_detected_at = time.monotonic()
                 self.console(
                     f"[{model}] stopping: available RAM {snapshot.available_ram_gb:.2f} GB "
                     f"fell below {self.config.min_available_ram_gb:.2f} GB floor"
@@ -345,16 +350,23 @@ class BenchmarkRunner:
                 break
             if time.monotonic() - started >= timeout:
                 abort_reason = "timeout"
+                abort_detected_at = time.monotonic()
                 self.console(f"[{model}] stopping: test exceeded {timeout:.0f} seconds")
                 break
             time.sleep(self.config.sample_interval_seconds)
 
         if abort_reason:
+            if abort_detected_at is None:
+                abort_detected_at = time.monotonic()
+            recovery_started = time.monotonic()
             recovery_ok = self._recover_request(model, thread)
+            finished = time.monotonic()
             return {
                 "status": abort_reason,
                 "recovery_status": "recovered" if recovery_ok else "failed",
-                "wall_time_seconds": round(time.monotonic() - started, 3),
+                "wall_time_seconds": round(abort_detected_at - started, 3),
+                "recovery_time_seconds": round(finished - recovery_started, 3),
+                "total_wall_time_seconds": round(finished - started, 3),
                 "metrics": {},
                 "resource_stats": request_stats.as_dict(),
             }
@@ -383,10 +395,12 @@ class BenchmarkRunner:
                 result["http_status"] = payload.status_code
             return result
         metrics = self._ollama_metrics(payload)
+        message = payload.get("message") or {}
         return {
             "status": "succeeded",
-            "response": payload.get("response", ""),
-            "thinking": payload.get("thinking") or None,
+            "api_endpoint": "chat",
+            "response": message.get("content") or payload.get("response", ""),
+            "thinking": message.get("thinking") or payload.get("thinking") or None,
             "done_reason": payload.get("done_reason"),
             "wall_time_seconds": round(time.monotonic() - started, 3),
             "metrics": metrics,
@@ -394,11 +408,31 @@ class BenchmarkRunner:
         }
 
     def _recover_request(self, model: str, thread: threading.Thread) -> bool:
-        self.client.stop_model(model)
         deadline = time.monotonic() + _RECOVERY_TIMEOUT_SECONDS
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            self.client.stop_model(
+                model,
+                timeout=min(2.0, remaining),
+                allow_fallback=False,
+            )
+        last_stop = time.monotonic()
         while thread.is_alive() and time.monotonic() < deadline:
-            thread.join(timeout=0.25)
-        remaining = max(0.25, deadline - time.monotonic())
+            thread.join(timeout=min(0.25, max(0.0, deadline - time.monotonic())))
+            now = time.monotonic()
+            if thread.is_alive() and now - last_stop >= 2.0:
+                remaining = deadline - now
+                if remaining <= 0:
+                    break
+                self.client.stop_model(
+                    model,
+                    timeout=min(1.0, remaining),
+                    allow_fallback=False,
+                )
+                last_stop = time.monotonic()
+        remaining = deadline - time.monotonic()
+        if thread.is_alive() or remaining <= 0:
+            return False
         service_ok = self.client.recover_after_abort(model, timeout=remaining)
         return service_ok and not thread.is_alive()
 
