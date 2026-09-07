@@ -7,6 +7,7 @@ import platform
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,18 +17,22 @@ import psutil
 _GB = 1024**3
 
 
-def discover_nvidia_smi() -> str | None:
+def discover_nvidia_smi(
+    *, platform_name: str | None = None, environ: Mapping[str, str] | None = None
+) -> str | None:
     found = shutil.which("nvidia-smi")
     if found:
         return found
-    if os.name != "nt":
+    current_platform = os.name if platform_name is None else platform_name
+    if current_platform != "nt":
         return None
+    env = os.environ if environ is None else environ
     candidates: list[Path] = []
     for variable in ("ProgramFiles", "ProgramW6432"):
-        root = os.environ.get(variable)
+        root = env.get(variable)
         if root:
             candidates.append(Path(root) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe")
-    system_root = os.environ.get("SystemRoot")
+    system_root = env.get("SystemRoot")
     if system_root:
         candidates.append(Path(system_root) / "System32" / "nvidia-smi.exe")
     for candidate in candidates:
