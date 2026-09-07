@@ -17,6 +17,63 @@ import psutil
 _GB = 1024**3
 
 
+def _windows_nvidia_smi_candidates(environ: Mapping[str, str]) -> list[Path]:
+    candidates: list[Path] = []
+    for variable in ("ProgramFiles", "ProgramW6432"):
+        root = environ.get(variable)
+        if root:
+            candidates.append(Path(root) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe")
+
+    system_roots: list[Path] = []
+    for variable in ("SystemRoot", "WINDIR", "windir"):
+        root = environ.get(variable)
+        if root:
+            system_roots.append(Path(root))
+    system_drive = environ.get("SystemDrive")
+    if system_drive:
+        system_roots.append(Path(f"{system_drive}\\Windows"))
+
+    # Windows is overwhelmingly installed here, and some Python environments do not
+    # expose SystemRoot/PATH the same way an interactive shell does. Probe the canonical
+    # location explicitly rather than making GPU telemetry depend on environment shape.
+    system_roots.append(Path(r"C:\Windows"))
+
+    for root in system_roots:
+        candidates.append(root / "System32" / "nvidia-smi.exe")
+        # Sysnative bypasses WOW64 filesystem redirection for 32-bit Python processes.
+        candidates.append(root / "Sysnative" / "nvidia-smi.exe")
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).casefold()
+        if key not in seen:
+            deduped.append(candidate)
+            seen.add(key)
+    return deduped
+
+
+def _where_nvidia_smi() -> str | None:
+    try:
+        proc = subprocess.run(
+            ["where.exe", "nvidia-smi.exe"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        candidate = Path(line.strip())
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def discover_nvidia_smi(
     *, platform_name: str | None = None, environ: Mapping[str, str] | None = None
 ) -> str | None:
@@ -26,16 +83,15 @@ def discover_nvidia_smi(
     current_platform = os.name if platform_name is None else platform_name
     if current_platform != "nt":
         return None
+
+    # `where.exe` uses Windows executable resolution and can succeed in environments
+    # where Python's shutil.which() does not see System32 the same way.
+    found = _where_nvidia_smi()
+    if found:
+        return found
+
     env = os.environ if environ is None else environ
-    candidates: list[Path] = []
-    for variable in ("ProgramFiles", "ProgramW6432"):
-        root = env.get(variable)
-        if root:
-            candidates.append(Path(root) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe")
-    system_root = env.get("SystemRoot")
-    if system_root:
-        candidates.append(Path(system_root) / "System32" / "nvidia-smi.exe")
-    for candidate in candidates:
+    for candidate in _windows_nvidia_smi_candidates(env):
         if candidate.is_file():
             return str(candidate)
     return None
