@@ -138,7 +138,7 @@ class ResourceCollector:
         }
 
     def _refresh_ollama_processes(self, now: float) -> None:
-        if self._ollama_processes and now - self._last_process_scan_at < 5.0:
+        if now - self._last_process_scan_at < 5.0:
             return
         processes: list[psutil.Process] = []
         for process in psutil.process_iter(["name"]):
