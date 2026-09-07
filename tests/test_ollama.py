@@ -1,4 +1,4 @@
-from model_benchmark.ollama import ModelCandidate, skip_reason
+from model_benchmark.ollama import ModelCandidate, OllamaClient, skip_reason
 
 
 def candidate(name: str) -> ModelCandidate:
@@ -30,3 +30,43 @@ def test_explicit_specialized_selection_is_an_escape_hatch() -> None:
     assert "remote/provider" in skip_reason(
         candidate("gemini-3-flash-preview:latest"), allow_specialized=True
     )
+
+
+def test_chat_disables_thinking_at_top_level_and_preserves_schema(monkeypatch) -> None:
+    client = OllamaClient()
+    captured: dict[str, object] = {}
+
+    def fake_request(method, path, *, payload=None, timeout):
+        captured["method"] = method
+        captured["path"] = path
+        captured["payload"] = payload
+        captured["timeout"] = timeout
+        return {"message": {"content": "OK"}}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    options = {"temperature": 0, "num_predict": 32}
+
+    client.chat(
+        "qwen3.5:9b",
+        "Return JSON.",
+        system="benchmark",
+        schema=schema,
+        options=options,
+        keep_alive=-1,
+        think=False,
+        timeout=12.5,
+    )
+
+    payload = captured["payload"]
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/api/chat"
+    assert captured["timeout"] == 12.5
+    assert payload["think"] is False
+    assert payload["format"] == schema
+    assert payload["options"] == options
+    assert "think" not in payload["options"]
+    assert payload["messages"] == [
+        {"role": "system", "content": "benchmark"},
+        {"role": "user", "content": "Return JSON."},
+    ]
